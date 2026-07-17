@@ -16,9 +16,18 @@ Features:
   - Real-time progress display per ligand
   - Best affinity extracted and saved to CSV
   - Graceful error handling per ligand
+  - Receptor is chosen via a file-picker window (no need to pass --receptor)
+  - The config file is opened for editing before each run starts
+  - Resumable: if the run is interrupted (crash / shutdown), re-running with
+    the same --output CSV skips ligands already recorded in it
 
 Usage:
-    python vina_docking.py --ligands  ./ligands --receptor ./receptor.pdbqt --output   ./affinity.csv --config   ./config.txt --workers  10
+    python3 vina_docking.py --ligands  ./ligands --output   ./affinity.csv --workers  10
+    (a window will open to pick the receptor .pdbqt, then the config file
+     will open for editing before docking begins)
+
+    # Non-interactive style still works if you pass both explicitly:
+    python3 vina_docking.py --ligands  ./ligands --receptor ./receptor.pdbqt --output   ./affinity.csv --config   ./config.txt --workers  10
 
 Config file (config.txt) example:
     center_x = -21.0
@@ -39,6 +48,8 @@ Dependencies:
 import argparse
 import csv
 import logging
+import os
+import platform
 import re
 import subprocess
 import sys
@@ -47,6 +58,14 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
 from threading import Lock
+
+# ── Tkinter for file-picker dialogs ─────────────────────────────────────────
+try:
+    import tkinter as tk
+    from tkinter import filedialog, messagebox
+    TKINTER_AVAILABLE = True
+except ImportError:
+    TKINTER_AVAILABLE = False
 
 # ── Optional rich for pretty progress ──────────────────────────────────────
 try:
@@ -75,6 +94,170 @@ SUPPORTED_EXT = {".pdbqt"}
 
 # ── CSV lock (thread-safe writes) ───────────────────────────────────────────
 csv_lock = Lock()
+
+
+# ============================================================
+#  GUI helpers (receptor picker + config editor)
+# ============================================================
+
+def _get_tk_root():
+    """Create a hidden Tk root window used only to host dialog boxes."""
+    root = tk.Tk()
+    root.withdraw()
+    root.attributes("-topmost", True)
+    return root
+
+
+def select_receptor_file():
+    """
+    Open a file-picker window so the user can choose the receptor .pdbqt.
+    Exits the program if the user cancels the dialog.
+    """
+    if not TKINTER_AVAILABLE:
+        log.error(
+            "tkinter is not available in this Python installation, so the "
+            "receptor file-picker window cannot be shown. Pass the file "
+            "explicitly with --receptor instead."
+        )
+        sys.exit(1)
+
+    root = _get_tk_root()
+    try:
+        path = filedialog.askopenfilename(
+            title="Selecione o arquivo do receptor (.pdbqt)",
+            filetypes=[("PDBQT files", "*.pdbqt"), ("All files", "*.*")],
+        )
+    finally:
+        root.destroy()
+
+    if not path:
+        log.error("Nenhum receptor selecionado. Encerrando.")
+        sys.exit(1)
+
+    return Path(path)
+
+
+def select_or_create_config_file(config_arg):
+    """
+    Resolve which config file to use:
+      - If --config was passed and exists, use it.
+      - Otherwise, let the user pick one via a file dialog. If they cancel,
+        fall back to creating a default 'config.txt' in the current folder.
+    Returns the resolved Path to the config file (guaranteed to exist).
+    """
+    if config_arg:
+        p = Path(config_arg)
+        if p.exists():
+            return p
+
+    if TKINTER_AVAILABLE:
+        root = _get_tk_root()
+        try:
+            path = filedialog.askopenfilename(
+                title="Selecione o arquivo de configuração (config.txt)",
+                filetypes=[("Text files", "*.txt"), ("All files", "*.*")],
+            )
+        finally:
+            root.destroy()
+        if path:
+            return Path(path)
+
+    # No file chosen (or tkinter unavailable) — create a default template
+    default_path = Path(config_arg) if config_arg else Path("config.txt")
+    if not default_path.exists():
+        default_path.write_text(
+            "center_x = 0.0\n"
+            "center_y = 0.0\n"
+            "center_z = 0.0\n"
+            "size_x   = 20\n"
+            "size_y   = 20\n"
+            "size_z   = 20\n"
+            "exhaustiveness = 8\n"
+            "num_modes = 9\n"
+            "energy_range = 3\n",
+            encoding="utf-8",
+        )
+        log.info("Arquivo de configuração criado: %s", default_path)
+    return default_path
+
+
+def open_file_for_editing(path):
+    """Open `path` with the OS default application (text editor)."""
+    path = str(path)
+    try:
+        system = platform.system()
+        if system == "Windows":
+            os.startfile(path)  # type: ignore[attr-defined]
+        elif system == "Darwin":
+            subprocess.Popen(["open", path])
+        else:
+            subprocess.Popen(["xdg-open", path])
+    except Exception as exc:
+        log.warning("Não foi possível abrir %s automaticamente: %s", path, exc)
+
+
+def edit_config_interactively(config_path):
+    """
+    Open the config file in the user's default editor and wait until the
+    user confirms they finished making changes (and saved the file) before
+    the docking run continues.
+    """
+    print("\nAbrindo o arquivo de configuração para edição:")
+    print(f"  {config_path}")
+    open_file_for_editing(config_path)
+
+    if TKINTER_AVAILABLE:
+        root = _get_tk_root()
+        try:
+            messagebox.showinfo(
+                "Configuração",
+                "Edite o arquivo de configuração que foi aberto.\n\n"
+                "Depois de salvar as alterações, clique em OK para continuar.",
+            )
+        finally:
+            root.destroy()
+    else:
+        input("Edite e salve o arquivo de configuração, depois pressione ENTER para continuar...")
+
+
+# ============================================================
+#  Resume support (skip ligands already present in the CSV)
+# ============================================================
+
+def load_processed_ligands(csv_path):
+    """
+    Read an existing affinity CSV (if any) and return the set of ligand
+    names already present in it. Used to resume a batch after a crash or
+    shutdown without redoing work that already finished.
+    """
+    processed = set()
+    csv_path = Path(csv_path)
+    if not csv_path.exists():
+        return processed
+    try:
+        with open(csv_path, newline="", encoding="utf-8") as fh:
+            reader = csv.reader(fh)
+            header = next(reader, None)
+            for row in reader:
+                if row:
+                    processed.add(row[0])
+    except Exception as exc:
+        log.warning("Não foi possível ler o CSV existente (%s): %s", csv_path, exc)
+    return processed
+
+
+def ensure_csv_header(csv_path):
+    """
+    Make sure the CSV file exists with a header row, WITHOUT wiping out
+    rows from a previous (possibly interrupted) run. This is what allows
+    resuming: existing rows are preserved and new rows are appended.
+    """
+    csv_path = Path(csv_path)
+    if csv_path.exists():
+        return  # keep existing content — resume mode
+    with open(csv_path, "w", newline="", encoding="utf-8") as fh:
+        writer = csv.writer(fh)
+        writer.writerow(["ligand", "affinity_kcal_mol", "elapsed_s", "status"])
 
 
 # ============================================================
@@ -457,12 +640,6 @@ def append_csv_row(csv_path, row):
             writer.writerow(row)
 
 
-def init_csv(csv_path):
-    with open(csv_path, "w", newline="", encoding="utf-8") as fh:
-        writer = csv.writer(fh)
-        writer.writerow(["ligand", "affinity_kcal_mol", "elapsed_s", "status"])
-
-
 # ============================================================
 #  Debug log writer
 # ============================================================
@@ -572,22 +749,43 @@ def run_batch(
     extra_args,
     debug=False,
 ):
-    receptor_path = Path(receptor).resolve()
+    # ── Receptor: ask the user via a file-picker window ─────
+    if receptor:
+        receptor_path = Path(receptor).resolve()
+        if not receptor_path.exists():
+            log.error("Receptor file not found: %s", receptor_path)
+            sys.exit(1)
+    else:
+        receptor_path = select_receptor_file().resolve()
+
     csv_path = Path(output_csv).resolve()
     debug_dir = csv_path.parent / "debug_logs"
-
-    # ── Validate inputs ─────────────────────────────────────
-    if not receptor_path.exists():
-        log.error("Receptor file not found: %s", receptor_path)
-        sys.exit(1)
 
     ligands = resolve_ligands(ligands_inputs)
     if not ligands:
         log.error("No valid .pdbqt ligand files found in the provided inputs.")
         sys.exit(1)
 
+    # ── Config: let the user open/edit it before the run starts ─
+    config_path = select_or_create_config_file(config_path)
+    edit_config_interactively(config_path)
     config = parse_config(config_path)
-    init_csv(csv_path)
+
+    # ── Resume support: skip ligands already recorded in the CSV ─
+    ensure_csv_header(csv_path)
+    already_processed = load_processed_ligands(csv_path)
+    if already_processed:
+        remaining = [lig for lig in ligands if lig.stem not in already_processed]
+        skipped = len(ligands) - len(remaining)
+        if skipped:
+            log.info(
+                "Retomando execução: %d ligante(s) já presentes em %s serão ignorados.",
+                skipped, csv_path.name,
+            )
+        ligands = remaining
+        if not ligands:
+            log.info("Todos os ligantes já foram processados em %s. Nada a fazer.", csv_path.name)
+            return
 
     # ── Debug log setup ─────────────────────────────────────
     debug_dir.mkdir(parents=True, exist_ok=True)
@@ -760,10 +958,18 @@ Examples:
                             "  file.pdbqt   -> individual ligand\n"
                             "  list.txt     -> text file with one path per line"
                         ))
-    parser.add_argument("--receptor",  required=True,
-                        help="Receptor .pdbqt file")
+    parser.add_argument("--receptor",  required=False, default=None,
+                        help=(
+                            "Receptor .pdbqt file. If omitted, a file-picker "
+                            "window opens so you can select it."
+                        ))
     parser.add_argument("--config",    default=None,
-                        help="Vina config file (center_x/y/z, size_x/y/z, etc.)")
+                        help=(
+                            "Vina config file (center_x/y/z, size_x/y/z, etc.). "
+                            "It will be opened for editing before the run starts; "
+                            "if omitted, you'll be asked to pick one (or a default "
+                            "is created)."
+                        ))
     parser.add_argument("--output",    default="affinity.csv",
                         help="Output CSV file (default: affinity.csv)")
     parser.add_argument("--workers",   type=int, default=4,
