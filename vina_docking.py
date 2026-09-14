@@ -12,47 +12,76 @@ Runs AutoDock Vina for every ligand in a folder against every protein
 found in a "proteins" folder, and saves the best binding affinity for
 each (protein, ligand) pair to a CSV file.
 
-Proteins folder layout (default: ./proteins):
-    proteins/
-        proteinA.pdbqt
-        proteinA_config.txt
-        proteinB.pdbqt
-        proteinB_config.txt
-        ...
+Recommended folder layout — config.txt, vina_docking.py and the output
+CSV (afinidade.csv) all live together in the same parent folder; only
+the raw receptor/ligand structures sit in their own subfolders:
 
-For each protein "x", the script expects:
-    x.pdbqt          -> the receptor structure
-    x_config.txt      -> the Vina config for that receptor (search box, etc.)
+    project/
+        vina_docking.py
+        config.txt          -> ONE unified config file for ALL proteins
+        afinidade.csv        -> results (created/updated by the script)
+        proteins/
+            ALB.pdbqt
+            APP.pdbqt
+            ...
+        ligands/
+            NuBBE_1.pdbqt
+            ...
+
+For each protein "x" (x.pdbqt) inside the proteins folder, the script
+expects a matching section named "[x]" inside config.txt, containing
+the Vina search-box parameters AND the protein's PDB ID (id_pdb):
+
+    [ALB]
+    id_pdb   = 1AO6
+    center_x = -0.620062
+    center_y = 0.179704
+    center_z = 0.667515
+    size_x   = 126
+    size_y   = 126
+    size_z   = 126
+    exhaustiveness = 8
+    num_modes = 9
+    energy_range = 3
+
+    [APP]
+    id_pdb   = 1AAP
+    center_x = 174.143101
+    center_y = 176.675063
+    center_z = 186.358477
+    size_x   = 126
+    size_y   = 126
+    size_z   = 126
+    exhaustiveness = 8
+    num_modes = 9
+    energy_range = 3
+
+The section name must match the protein's file name (without the
+.pdbqt extension). "id_pdb" is used only to fill the ID_pdb column of
+the results CSV — it is NOT passed to Vina as a docking parameter.
 
 Features:
-  - Iterates over every protein/config pair in the proteins folder
+  - Iterates over every protein found in the proteins folder, reading its
+    search-box parameters and PDB ID from the single config.txt file
   - Docks every ligand against every protein (cartesian product)
   - Parallel execution (up to 10 jobs simultaneously)
   - Real-time progress display per job
-  - Best affinity extracted and saved to CSV (protein, ligand, affinity)
+  - Best affinity extracted and saved to CSV (Alvo, ID_pdb, Ligante, Afinidade)
   - Graceful error handling per job
   - Resumable: if the run is interrupted (crash / shutdown), re-running with
     the same --output CSV skips (protein, ligand) pairs already recorded in it
 
-Usage:
-    python3 vina_docking.py --proteins ./proteins --ligands ./ligands --output affinity.csv --workers 10
+Usage (run from the project's parent folder, where config.txt lives):
+    python3 vina_docking.py --proteins ./proteins --ligands ./ligands --output afinidade.csv --workers 10
+
+    # Custom location for config.txt:
+    python3 vina_docking.py --config ./config.txt --proteins ./proteins --ligands ./ligands
 
     # Individual ligand files / a text list also work, same as before:
-    python3 vina_docking.py --proteins ./proteins --ligands FDA_001.pdbqt NuBBE_1.pdbqt --output affinity.csv
+    python3 vina_docking.py --proteins ./proteins --ligands FDA_001.pdbqt NuBBE_1.pdbqt --output afinidade.csv
 
     # Extra Vina args (after --):
     python3 vina_docking.py --proteins ./proteins --ligands ./ligands -- --exhaustiveness 16
-
-Config file (x_config.txt) example:
-    center_x = -21.0
-    center_y =  -0.9
-    center_z = -47.4
-    size_x   =  20
-    size_y   =  20
-    size_z   =  20
-    exhaustiveness = 8
-    num_modes = 9
-    energy_range = 3
 
 Dependencies:
     AutoDock Vina must be installed and in PATH.
@@ -60,6 +89,7 @@ Dependencies:
 """
 
 import argparse
+import configparser
 import csv
 import logging
 import os
@@ -92,7 +122,7 @@ logging.basicConfig(level=logging.INFO, format="%(message)s")
 log = logging.getLogger(__name__)
 
 SUPPORTED_EXT = {".pdbqt"}
-CONFIG_SUFFIX = "_config.txt"
+CONFIG_FILENAME = "config.txt"
 
 # ── CSV lock (thread-safe writes) ───────────────────────────────────────────
 csv_lock = Lock()
@@ -107,6 +137,8 @@ def load_processed_pairs(csv_path):
     Read an existing affinity CSV (if any) and return the set of
     (protein, ligand) tuples already present in it. Used to resume a
     batch after a crash or shutdown without redoing finished work.
+
+    CSV columns: Alvo, ID_pdb, Ligante, Afinidade
     """
     processed = set()
     csv_path = Path(csv_path)
@@ -117,8 +149,8 @@ def load_processed_pairs(csv_path):
             reader = csv.reader(fh)
             header = next(reader, None)
             for row in reader:
-                if len(row) >= 2:
-                    processed.add((row[0], row[1]))
+                if len(row) >= 3:
+                    processed.add((row[0], row[2]))  # (Alvo, Ligante)
     except Exception as exc:
         log.warning("Não foi possível ler o CSV existente (%s): %s", csv_path, exc)
     return processed
@@ -135,31 +167,53 @@ def ensure_csv_header(csv_path):
         return  # keep existing content — resume mode
     with open(csv_path, "w", newline="", encoding="utf-8") as fh:
         writer = csv.writer(fh)
-        writer.writerow(["protein", "ligand", "affinity"])
+        writer.writerow(["Alvo", "ID_pdb", "Ligante", "Afinidade"])
 
 
 # ============================================================
 #  Config helpers
 # ============================================================
 
-def parse_config(config_path):
-    """Parse a Vina config file into a dict of key->value strings."""
-    config = {}
-    if config_path is None:
-        return config
+def parse_proteins_config(config_path):
+    """
+    Parse the single, unified proteins config file (INI-style, one
+    section per protein). Example:
+
+        [ALB]
+        id_pdb   = 1AO6
+        center_x = -0.620062
+        ...
+
+        [APP]
+        id_pdb   = 1AAP
+        center_x = 174.143101
+        ...
+
+    The section name must match the protein's .pdbqt file name (stem).
+    "id_pdb" is extracted separately and is NOT forwarded to Vina.
+
+    Returns a dict:
+        {section_name: {"id_pdb": str, "vina": {key: val, ...}}}
+    """
     path = Path(config_path)
     if not path.exists():
-        log.error("Config file not found: %s", config_path)
+        log.error("Arquivo de configuração não encontrado: %s", path)
         sys.exit(1)
-    with open(path) as fh:
-        for line in fh:
-            line = line.strip()
-            if not line or line.startswith("#"):
-                continue
-            if "=" in line:
-                key, _, val = line.partition("=")
-                config[key.strip()] = val.strip()
-    return config
+
+    parser = configparser.ConfigParser()
+    parser.optionxform = str  # preserve key case, e.g. center_x stays lowercase as-is
+    try:
+        parser.read(path, encoding="utf-8")
+    except configparser.Error as exc:
+        log.error("Erro ao ler %s: %s", path, exc)
+        sys.exit(1)
+
+    result = {}
+    for section in parser.sections():
+        raw = {k.strip(): v.strip() for k, v in parser.items(section)}
+        id_pdb = raw.pop("id_pdb", "")
+        result[section] = {"id_pdb": id_pdb, "vina": raw}
+    return result
 
 
 def build_vina_command(vina_bin, receptor, ligand, output_path, config, extra_args):
@@ -381,6 +435,7 @@ def run_docking(
     ligand_path,
     protein_name,
     protein_path,
+    id_pdb,
     vina_bin,
     config,
     extra_args,
@@ -392,7 +447,7 @@ def run_docking(
 ):
     """
     Run a single Vina docking job for one (protein, ligand) pair.
-    Returns (protein_name, ligand_name, affinity_kcal, elapsed_s, error_msg, vina_stdout).
+    Returns (protein_name, id_pdb, ligand_name, affinity_kcal, elapsed_s, error_msg, vina_stdout).
     Pose output is written to a temp file and deleted immediately after.
     """
     import tempfile, os
@@ -458,7 +513,7 @@ def run_docking(
             if debug:
                 print("\n[DEBUG] Full Vina output for {}:\n{}".format(job_key, result.stdout))
             _set_status(f"[red]FAILED[/red]")
-            return protein_name, ligand_name, None, elapsed, err, result.stdout
+            return protein_name, id_pdb, ligand_name, None, elapsed, err, result.stdout
 
         _set_status(
             f"[green]done[/green] [bold]{affinity:.2f} kcal/mol[/bold] "
@@ -466,22 +521,22 @@ def run_docking(
         )
         if progress and task_id is not None:
             progress.advance(task_id)
-        return protein_name, ligand_name, affinity, elapsed, None, result.stdout
+        return protein_name, id_pdb, ligand_name, affinity, elapsed, None, result.stdout
 
     except FileNotFoundError:
         elapsed = time.monotonic() - t0
         _set_status("[red]vina not found[/red]")
-        return protein_name, ligand_name, None, elapsed, (
+        return protein_name, id_pdb, ligand_name, None, elapsed, (
             f"'{vina_bin}' not found. Install Vina and ensure it is in PATH."
         ), ""
     except subprocess.TimeoutExpired:
         elapsed = time.monotonic() - t0
         _set_status("[red]timeout[/red]")
-        return protein_name, ligand_name, None, elapsed, "Vina timed out after 3600 s.", ""
+        return protein_name, id_pdb, ligand_name, None, elapsed, "Vina timed out after 3600 s.", ""
     except Exception as exc:
         elapsed = time.monotonic() - t0
         _set_status(f"[red]error: {exc}[/red]")
-        return protein_name, ligand_name, None, elapsed, str(exc), ""
+        return protein_name, id_pdb, ligand_name, None, elapsed, str(exc), ""
     finally:
         # Delete temp pose file — we only need the affinity value
         try:
@@ -522,11 +577,22 @@ def append_csv_row(csv_path, row):
             writer.writerow(row)
 
 
+def format_affinity_br(affinity):
+    """
+    Format the affinity score using a comma as the decimal separator
+    (pt-BR convention), e.g. -7.465 -> "-7,465". Returns "" if affinity
+    is None (failed job).
+    """
+    if affinity is None:
+        return ""
+    return str(affinity).replace(".", ",")
+
+
 # ============================================================
 #  Debug log writer
 # ============================================================
 
-def write_debug_log(debug_dir, protein_name, ligand_name, affinity, elapsed, err, vina_output,
+def write_debug_log(debug_dir, protein_name, id_pdb, ligand_name, affinity, elapsed, err, vina_output,
                     session_log_lock=None, session_log_path=None):
     """
     Append per-job debug info directly to the consolidated
@@ -543,6 +609,7 @@ def write_debug_log(debug_dir, protein_name, ligand_name, affinity, elapsed, err
         with open(session_log_path, "a", encoding="utf-8") as fh:
             fh.write("=" * 60 + "\n")
             fh.write("  Protein  : {}\n".format(protein_name))
+            fh.write("  ID_pdb   : {}\n".format(id_pdb))
             fh.write("  Ligand   : {}\n".format(ligand_name))
             fh.write("  Status   : {}\n".format(status))
             if affinity is not None:
@@ -613,32 +680,43 @@ def resolve_ligands(inputs):
     return ligands
 
 
-def resolve_proteins(proteins_dir):
+def resolve_proteins(proteins_dir, config_path):
     """
-    Scan the proteins folder for receptor/config pairs:
-        x.pdbqt + x_config.txt
+    Scan the proteins folder for receptor files (x.pdbqt) and match each
+    one against its section "[x]" inside the single, unified config file
+    (config_path — typically living in the project's parent folder,
+    alongside the script and the output CSV, not inside proteins_dir).
 
-    Returns a sorted list of dicts: {"name": x, "receptor": Path, "config": Path}.
-    Proteins missing their matching config file are skipped with a warning.
+    Returns a sorted list of dicts:
+        {"name": x, "receptor": Path, "id_pdb": str, "config_parsed": dict}
+    Proteins missing a matching section in config_path are skipped with a warning.
     """
     proteins_dir = Path(proteins_dir).resolve()
     if not proteins_dir.is_dir():
         log.error("Pasta de proteínas não encontrada: %s", proteins_dir)
         sys.exit(1)
 
+    config_path = Path(config_path).resolve()
+    all_configs = parse_proteins_config(config_path)
+
     proteins = []
     for f in sorted(proteins_dir.iterdir()):
         if not f.is_file() or f.suffix.lower() != ".pdbqt":
             continue
         name = f.stem
-        config_path = proteins_dir / "{}_config.txt".format(name)
-        if not config_path.exists():
+        cfg = all_configs.get(name)
+        if cfg is None:
             log.warning(
-                "  [SKIP] Proteína '%s': arquivo de configuração não encontrado (%s)",
-                name, config_path.name,
+                "  [SKIP] Proteína '%s': nenhuma seção [%s] encontrada em %s",
+                name, name, config_path.name,
             )
             continue
-        proteins.append({"name": name, "receptor": f, "config": config_path})
+        proteins.append({
+            "name": name,
+            "receptor": f,
+            "id_pdb": cfg["id_pdb"],
+            "config_parsed": cfg["vina"],
+        })
 
     return proteins
 
@@ -650,15 +728,20 @@ def run_batch(
     vina_bin,
     workers,
     extra_args,
+    config_path=CONFIG_FILENAME,
     debug=False,
 ):
     csv_path = Path(output_csv).resolve()
     debug_dir = csv_path.parent / "debug_logs"
 
-    # ── Proteins: scan the proteins folder for x.pdbqt / x_config.txt ──
-    proteins = resolve_proteins(proteins_dir)
+    # ── Proteins: scan the proteins folder for x.pdbqt files, matching ──
+    # ── each one to its section inside the single config file ──────────
+    proteins = resolve_proteins(proteins_dir, config_path)
     if not proteins:
-        log.error("Nenhuma proteína válida (x.pdbqt + x_config.txt) encontrada em: %s", proteins_dir)
+        log.error(
+            "Nenhuma proteína válida (x.pdbqt + seção [x] em %s) encontrada em: %s",
+            config_path, proteins_dir,
+        )
         sys.exit(1)
 
     # ── Ligands ──────────────────────────────────────────────
@@ -666,10 +749,6 @@ def run_batch(
     if not ligands:
         log.error("No valid .pdbqt ligand files found in the provided inputs.")
         sys.exit(1)
-
-    # Pre-parse each protein's config once
-    for prot in proteins:
-        prot["config_parsed"] = parse_config(prot["config"])
 
     # ── Build the full job list (cartesian product) ─────────
     jobs = [(prot, lig) for prot in proteins for lig in ligands]
@@ -700,7 +779,8 @@ def run_batch(
     with open(session_log_path, "w", encoding="utf-8") as fh:
         fh.write("Vina Batch Docking — Session Log\n")
         fh.write("Started   : {}\n".format(datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
-        fh.write("Proteins  : {} ({})\n".format(len(proteins), ", ".join(p["name"] for p in proteins)))
+        fh.write("Proteins  : {} ({})\n".format(
+            len(proteins), ", ".join("{}[{}]".format(p["name"], p["id_pdb"]) for p in proteins)))
         fh.write("Ligands   : {} files\n".format(len(ligands)))
         fh.write("Jobs      : {} (protein x ligand)\n".format(len(jobs)))
         fh.write("=" * 60 + "\n\n")
@@ -731,6 +811,7 @@ def run_batch(
                 lig,
                 prot["name"],
                 prot["receptor"],
+                prot["id_pdb"],
                 vina_bin,
                 prot["config_parsed"],
                 extra_args,
@@ -764,11 +845,11 @@ def run_batch(
             with ThreadPoolExecutor(max_workers=workers) as executor:
                 futures = _submit_all(executor, progress, tasks)
                 for future in as_completed(futures):
-                    protein_name, ligand_name, affinity, elapsed, err, vina_out = future.result()
-                    append_csv_row(csv_path, [protein_name, ligand_name, affinity if affinity is not None else ""])
-                    write_debug_log(debug_dir, protein_name, ligand_name, affinity, elapsed, err, vina_out,
+                    protein_name, id_pdb, ligand_name, affinity, elapsed, err, vina_out = future.result()
+                    append_csv_row(csv_path, [protein_name, id_pdb, ligand_name, format_affinity_br(affinity)])
+                    write_debug_log(debug_dir, protein_name, id_pdb, ligand_name, affinity, elapsed, err, vina_out,
                                     session_log_lock, session_log_path)
-                    results.append((protein_name, ligand_name, affinity, elapsed, err))
+                    results.append((protein_name, id_pdb, ligand_name, affinity, elapsed, err))
                     progress.advance(overall)
 
     else:
@@ -777,34 +858,34 @@ def run_batch(
         with ThreadPoolExecutor(max_workers=workers) as executor:
             futures = _submit_all(executor)
             for future in as_completed(futures):
-                protein_name, ligand_name, affinity, elapsed, err, vina_out = future.result()
+                protein_name, id_pdb, ligand_name, affinity, elapsed, err, vina_out = future.result()
                 status = "ok" if affinity is not None else "error"
-                append_csv_row(csv_path, [protein_name, ligand_name, affinity if affinity is not None else ""])
-                write_debug_log(debug_dir, protein_name, ligand_name, affinity, elapsed, err, vina_out,
+                append_csv_row(csv_path, [protein_name, id_pdb, ligand_name, format_affinity_br(affinity)])
+                write_debug_log(debug_dir, protein_name, id_pdb, ligand_name, affinity, elapsed, err, vina_out,
                                 session_log_lock, session_log_path)
-                results.append((protein_name, ligand_name, affinity, elapsed, err))
+                results.append((protein_name, id_pdb, ligand_name, affinity, elapsed, err))
                 tag = f"{affinity:.2f} kcal/mol" if affinity else f"FAILED — {err}"
-                log.info("  [%s] %s :: %s  %s  (%.0fs)", status.upper(), protein_name, ligand_name, tag, elapsed)
+                log.info("  [%s] %s (%s) :: %s  %s  (%.0fs)", status.upper(), protein_name, id_pdb, ligand_name, tag, elapsed)
 
     # ── Summary ──────────────────────────────────────────────
-    ok = [(p, n, a, t) for p, n, a, t, e in results if a is not None]
-    failed = [(p, n, e) for p, n, a, t, e in results if a is None]
+    ok = [(p, i, n, a, t) for p, i, n, a, t, e in results if a is not None]
+    failed = [(p, i, n, e) for p, i, n, a, t, e in results if a is None]
 
-    ok_sorted = sorted(ok, key=lambda x: x[2])
+    ok_sorted = sorted(ok, key=lambda x: x[3])
 
     print(f"\n{sep}")
     print(f"  Results saved → {csv_path}")
     print(f"  Completed: {len(ok)}/{len(jobs)}  |  Errors: {len(failed)}")
     if ok_sorted:
         best = ok_sorted[0]
-        print(f"\n  🏆 Best affinity: {best[0]} :: {best[1]}  →  {best[2]:.2f} kcal/mol")
+        print(f"\n  🏆 Best affinity: {best[0]} ({best[1]}) :: {best[2]}  →  {best[3]:.2f} kcal/mol")
         print(f"\n  Top 5:")
-        for i, (p, n, a, t) in enumerate(ok_sorted[:5], 1):
-            print(f"    {i}. {p:<20} {n:<25} {a:>8.2f} kcal/mol")
+        for i, (p, pid, n, a, t) in enumerate(ok_sorted[:5], 1):
+            print(f"    {i}. {p:<12} {pid:<10} {n:<25} {a:>8.2f} kcal/mol")
     if failed:
         print(f"\n  Errors ({len(failed)}):")
-        for p, n, e in failed:
-            print(f"    ✗ {p} :: {n}: {e}")
+        for p, pid, n, e in failed:
+            print(f"    ✗ {p} ({pid}) :: {n}: {e}")
     print(f"{sep}\n")
 
     # Write session footer to consolidated log
@@ -815,7 +896,8 @@ def run_batch(
         fh.write("Completed: {}/{}\n".format(len(ok), len(results)))
         fh.write("Errors   : {}\n".format(len(failed)))
         if ok_sorted:
-            fh.write("Best     : {} :: {}  {:.4g} kcal/mol\n".format(ok_sorted[0][0], ok_sorted[0][1], ok_sorted[0][2]))
+            fh.write("Best     : {} ({})  ::  {}  {:.4g} kcal/mol\n".format(
+                ok_sorted[0][0], ok_sorted[0][1], ok_sorted[0][2], ok_sorted[0][3]))
         fh.write("=" * 60 + "\n")
 
 
@@ -829,8 +911,8 @@ if __name__ == "__main__":
         formatter_class=argparse.RawTextHelpFormatter,
         epilog="""
 Examples:
-  # Proteins folder (x.pdbqt + x_config.txt) x folder of ligands:
-  python vina_docking.py --proteins ./proteins --ligands ./ligands --output affinity.csv
+  # Proteins folder (x.pdbqt files + one unified config.txt) x folder of ligands:
+  python vina_docking.py --proteins ./proteins --ligands ./ligands --output afinidade.csv
 
   # Individual .pdbqt ligand files:
   python vina_docking.py --proteins ./proteins --ligands FDA_001.pdbqt NuBBE_1.pdbqt
@@ -848,10 +930,17 @@ Examples:
 
     parser.add_argument("--proteins", default="proteins",
                         help=(
-                            "Folder containing protein files as pairs:\n"
-                            "  x.pdbqt        -> receptor\n"
-                            "  x_config.txt   -> Vina config for that receptor\n"
+                            "Folder containing only the receptor structures:\n"
+                            "  x.pdbqt      -> one or more receptor files\n"
                             "(default: ./proteins)"
+                        ))
+    parser.add_argument("--config", default=CONFIG_FILENAME,
+                        help=(
+                            "Path to the ONE unified config file, with a\n"
+                            "[x] section per receptor (search box params + id_pdb).\n"
+                            "Lives in the project's parent folder, alongside this\n"
+                            "script and the output CSV — NOT inside --proteins.\n"
+                            "(default: ./config.txt)"
                         ))
     parser.add_argument("--ligands", required=True, nargs="+",
                         help=(
@@ -860,8 +949,8 @@ Examples:
                             "  file.pdbqt   -> individual ligand\n"
                             "  list.txt     -> text file with one path per line"
                         ))
-    parser.add_argument("--output",    default="affinity.csv",
-                        help="Output CSV file with columns protein,ligand,affinity (default: affinity.csv)")
+    parser.add_argument("--output",    default="afinidade.csv",
+                        help="Output CSV file with columns Alvo,ID_pdb,Ligante,Afinidade (default: afinidade.csv)")
     parser.add_argument("--workers",   type=int, default=4,
                         help="Parallel workers, max 10 (default: 4)")
     parser.add_argument("--vina",      default="vina",
@@ -887,5 +976,6 @@ Examples:
         vina_bin=args.vina,
         workers=args.workers,
         extra_args=extra,
+        config_path=args.config,
         debug=args.debug,
     )
