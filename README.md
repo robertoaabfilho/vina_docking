@@ -59,6 +59,11 @@ energy_range = 3
 - Os demais campos (`center_x/y/z`, `size_x/y/z`, `exhaustiveness`,
   `num_modes`, `energy_range`) são os parâmetros normais do Vina e são
   passados diretamente como flags `--center_x`, `--size_x`, etc.
+  - `exhaustiveness`: controla o esforço de busca do Vina — quantas vezes
+    o algoritmo repete a busca antes de escolher o melhor resultado.
+    Valores mais altos (ex.: 16, 32) tendem a dar poses mais confiáveis, ao
+    custo de um docking mais lento; valores mais baixos (ex.: 8, o padrão)
+    são mais rápidos, mas com maior chance de não achar o mínimo global.
 - Proteínas sem seção correspondente em `config.txt` são ignoradas (com
   aviso no log).
 
